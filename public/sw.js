@@ -22,8 +22,8 @@ self.addEventListener('push', (event) => {
   const title = data.title || '💸 새 결제 요청'
   const options = {
     body: data.body || '',
-    icon: '/icon-192.svg',
-    badge: '/icon-192.svg',
+    icon: '/icon-192.png',
+    badge: '/icon-192.png',
     data: { url: data.url || '/' },
     vibrate: [80, 40, 80],
   }
