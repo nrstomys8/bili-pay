@@ -1,7 +1,8 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { supabase } from '../lib/supabase'
+import { subscribeToPush, getCurrentSubscription, isPushSupported } from '../lib/push'
 
 type Status = '대기' | '결제중' | '완료'
 type Method = '쿠팡' | '네이버' | '계좌이체' | '기타'
@@ -80,11 +81,7 @@ export default function Home() {
     link: '', memo: '', requester: '',
   })
 
-  // 결제중 → 완료 확인 모달
-  const [pendingConfirm, setPendingConfirm] = useState<PaymentRequest | null>(null)
-  // 사용자가 "결제 링크 열기"를 눌렀을 때, 어떤 요청을 추적 중인지
-  const trackingIdRef = useRef<string | null>(null)
-  const linkOpenedAtRef = useRef<number>(0)
+  // 알림 토스트용 ref만 유지 (결제중 추적은 더 이상 사용 안 함 — 즉시 완료 처리로 변경됨)
 
   // 토스트
   const [toast, setToast] = useState<string | null>(null)
@@ -93,13 +90,17 @@ export default function Home() {
     window.setTimeout(() => setToast(null), 1800)
   }, [])
 
-  // 알림 권한 상태
+  // 알림/구독 상태
   const [notifPerm, setNotifPerm] = useState<NotificationPermission | 'unsupported'>('unsupported')
+  const [pushSubscribed, setPushSubscribed] = useState(false)
 
   useEffect(() => {
     fetchAll()
     if (typeof window !== 'undefined' && 'Notification' in window) {
       setNotifPerm(Notification.permission)
+    }
+    if (isPushSupported()) {
+      getCurrentSubscription().then((s) => setPushSubscribed(!!s))
     }
   }, [])
 
@@ -138,23 +139,6 @@ export default function Home() {
       supabase.removeChannel(channel)
     }
   }, [])
-
-  // 탭이 다시 보이면 (= 외부 사이트 갔다 돌아왔을 때) "결제 진행 중" 확인 모달
-  useEffect(() => {
-    function onVisible() {
-      if (document.visibilityState !== 'visible') return
-      const id = trackingIdRef.current
-      if (!id) return
-      // 3초 이상 떠나 있었던 경우에만 (단순 포커스 잃은 게 아니라 외부 사이트 다녀온 것으로 간주)
-      const elapsed = Date.now() - linkOpenedAtRef.current
-      if (elapsed < 3000) return
-      const target = items.find((i) => i.id === id)
-      trackingIdRef.current = null
-      if (target) setPendingConfirm(target)
-    }
-    document.addEventListener('visibilitychange', onVisible)
-    return () => document.removeEventListener('visibilitychange', onVisible)
-  }, [items])
 
   async function fetchAll() {
     setLoading(true)
@@ -260,25 +244,27 @@ export default function Home() {
       showToast('결제 링크/계좌가 없습니다')
       return
     }
-    // 계좌이체이면 그냥 계좌번호 복사
+    const now = new Date().toISOString()
+    // 계좌이체 → 계좌번호 복사 + 즉시 완료 처리
     if (req.method === '계좌이체') {
-      navigator.clipboard?.writeText(req.link).then(() => showToast('계좌번호 복사됨'))
-      // 계좌이체도 결제중으로 변경
+      if (navigator.clipboard) {
+        await navigator.clipboard.writeText(req.link).catch(() => {})
+      }
       await supabase
         .from('payment_requests')
-        .update({ status: '결제중', link_opened_at: new Date().toISOString() })
+        .update({ status: '완료', link_opened_at: now, completed_at: now })
         .eq('id', req.id)
+      showToast('계좌번호 복사 + 완료 처리됨')
       return
     }
-    // URL 열기 + 결제중으로 변경
+    // 결제 링크 → 새 탭으로 열기 + 즉시 완료 처리
     const url = req.link.startsWith('http') ? req.link : `https://${req.link}`
-    trackingIdRef.current = req.id
-    linkOpenedAtRef.current = Date.now()
     await supabase
       .from('payment_requests')
-      .update({ status: '결제중', link_opened_at: new Date().toISOString() })
+      .update({ status: '완료', link_opened_at: now, completed_at: now })
       .eq('id', req.id)
     window.open(url, '_blank', 'noopener,noreferrer')
+    showToast('완료 처리됨 — 실수면 ↺ 되돌리기')
   }
 
   async function markCompleted(id: string) {
@@ -301,14 +287,22 @@ export default function Home() {
     showToast('대기 상태로 되돌렸습니다')
   }
 
-  async function requestNotifPerm() {
-    if (!('Notification' in window)) {
-      showToast('이 브라우저는 알림을 지원하지 않습니다')
+  async function enablePushNotifications() {
+    if (!isPushSupported()) {
+      showToast('이 브라우저는 푸시 알림을 지원하지 않습니다')
       return
     }
-    const perm = await Notification.requestPermission()
-    setNotifPerm(perm)
-    if (perm === 'granted') showToast('알림이 켜졌습니다')
+    // 라벨로 기기 식별 (예: "주석폰", "센터장PC" 등) — 비워두면 자동
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent : ''
+    const isMobile = /iPhone|Android|Mobile/i.test(ua)
+    const defaultLabel = isMobile ? '모바일' : 'PC'
+    const label = prompt('이 기기 이름을 입력하세요 (예: 주석폰, 사무실PC)', defaultLabel)
+    if (label === null) return // 취소
+    const result = await subscribeToPush(label || defaultLabel)
+    setNotifPerm(Notification.permission)
+    setPushSubscribed(result.ok)
+    if (result.ok) showToast('알림이 켜졌습니다 (앱이 꺼져있어도 옴)')
+    else showToast('실패: ' + (result.error ?? '알 수 없는 오류'))
   }
 
   // 월별 필터
@@ -392,9 +386,9 @@ export default function Home() {
             <p className="text-[11px] text-zinc-500">브리시엘 비품 결제 관리</p>
           </div>
           <div className="flex items-center gap-1.5">
-            {notifPerm !== 'granted' && (
+            {!pushSubscribed && (
               <button
-                onClick={requestNotifPerm}
+                onClick={enablePushNotifications}
                 className="text-xs px-2.5 py-1.5 rounded-lg bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25"
               >
                 🔔 알림 켜기
@@ -600,38 +594,6 @@ export default function Home() {
           </div>
         )}
       </section>
-
-      {/* "구매하셨나요?" 확인 모달 */}
-      {pendingConfirm && (
-        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 p-4">
-          <div className="w-full max-w-sm rounded-2xl bg-zinc-900 border border-white/10 p-5 space-y-4">
-            <div>
-              <div className="text-2xl mb-1">🛒</div>
-              <h3 className="text-lg font-bold">구매 완료하셨나요?</h3>
-              <p className="text-sm text-zinc-400 mt-1">
-                <span className="text-white">{pendingConfirm.title}</span> · {formatWon(pendingConfirm.amount)}
-              </p>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={() => setPendingConfirm(null)}
-                className="py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 font-medium"
-              >
-                아니요
-              </button>
-              <button
-                onClick={() => {
-                  markCompleted(pendingConfirm.id)
-                  setPendingConfirm(null)
-                }}
-                className="py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold"
-              >
-                완료 처리
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* 토스트 */}
       {toast && (
